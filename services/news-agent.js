@@ -152,18 +152,24 @@ export class UdoNewsAgent {
 5. ตกแต่งด้วย Emoji ที่สอดคล้องกับข่าวสารเพื่อเพิ่มมิติความน่าสนใจ
 6. ปฏิเสธการพิมพ์ขั้นตอนการคิดในใจอย่าง <think>...</think> ออกมายังคำตอบหลักเด็ดขาด ให้พ่นเฉพาะข้อความที่สรุปแล้วเท่านั้น`;
 
+      // think: false — ปิดโหมดคิดลึกของ Qwen3 เพื่อให้โมเดลตอบตรงๆ ไม่ผ่าน <think>
+      // หาก Ollama เวอร์ชันเก่าไม่รองรับ parameter นี้จะถูกละเว้นโดยอัตโนมัติ
       const response = await ollama.generate({
         model: this.aiModel,
         prompt: `${systemPrompt}\n\nนี่คือรายชื่อเนื้อความข่าวดิบล่าสุดจาก ${this.sourceName} โปรดจัดโครงสร้างสรุปย่อย:\n\n${newsContext}`,
+        think: false,
       });
 
-      if (!response?.response) {
+      // Ollama 0.6+ แยก thinking content ออกจาก visible response
+      // หาก response.response ว่าง (โมเดลใส่ทุกอย่างใน <think>) ให้ fallback ไปใช้ response.thinking
+      const aiText = response?.response || response?.thinking || '';
+      if (!aiText) {
         throw new Error(`โมเดล AI (${this.aiModel}) ตอบกลับค่าว่างเปล่า`);
       }
 
-      console.log(`[UDO News] ได้รับคำตอบจาก Ollama (${response.response.length} ตัวอักษร)`);
+      console.log(`[UDO News] ได้รับคำตอบจาก Ollama (${aiText.length} ตัวอักษร)`);
 
-      const cleanedResult = this.cleanResponse(response.response);
+      const cleanedResult = this.cleanResponse(aiText);
       if (!cleanedResult) {
         throw new Error('ผลสรุปข่าวจาก AI ว่างเปล่าหลังกรอง <think>');
       }

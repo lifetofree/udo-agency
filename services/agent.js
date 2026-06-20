@@ -35,9 +35,10 @@ export class UdoAgentService {
       const architectResponse = await ollama.generate({
         model: this.coreModel,
         prompt: `You are an elite Business Architect & AI Software Engineer. Based on this goal: "${userGoal}", provide a highly technical, automated system architecture and clean database/code outline. Keep it concise, system-driven, and resource-efficient.`,
+        think: false,
         options: { temperature: 0.2 }
       });
-      architectureResult = architectResponse.response;
+      architectureResult = architectResponse.response || architectResponse.thinking || '';
       console.log(`[UDO Agent] ได้รับผลสถาปัตยกรรมจาก ${this.coreModel} แล้ว`);
     } catch (err) {
       throw new Error(`[UDO Agent] ${this.coreModel} ตอบกลับล้มเหลว: ${err.message}`);
@@ -50,9 +51,10 @@ export class UdoAgentService {
       const marketingResponse = await ollama.generate({
         model: this.creativeModel,
         prompt: `You are a Solopreneur Marketing Expert. Based on this technical infrastructure: "${architectureResult}", craft an authentic marketing angle, content strategy, and a high-converting hook. Ensure the tone is supportively witty and direct.`,
+        think: false,
         options: { temperature: 0.5 }
       });
-      marketingResult = marketingResponse.response;
+      marketingResult = marketingResponse.response || marketingResponse.thinking || '';
       console.log(`[UDO Agent] ได้รับผลกลยุทธ์การตลาดจาก ${this.creativeModel} แล้ว`);
     } catch (err) {
       throw new Error(`[UDO Agent] ${this.creativeModel} ตอบกลับล้มเหลว: ${err.message}`);
