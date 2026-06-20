@@ -1,4 +1,5 @@
 import { Telegraf } from 'telegraf';
+import { message } from 'telegraf/filters';
 import { UdoNewsAgent } from './services/news-agent.js';
 import ollama from 'ollama';
 import dotenv from 'dotenv';
@@ -14,11 +15,6 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
 
 // เริ่มต้นเปิดระบบประตูกล Telegram Bot
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
-
-// ผูกระบบเข้ากับโมดูลแกะข่าวไอทีขั้นสูง (News Agent Service)
-const newsAgent = new UdoNewsAgent({
-  aiModel: 'qwen3.5:9b' // เรียกใช้งานโมเดล 9B ตัวคลีนวิ่งฉลุยบน Mac M3 Pro
-});
 
 // กำหนดโมเดลสำหรับใช้ร่างคอนเทนต์ด่วน
 const DRAFT_MODEL = 'qwen3.5:9b';
@@ -56,39 +52,55 @@ function cleanAiResponse(text) {
 
 // ข้อความตอบรับเมื่อเปิดรันบอทและทักใช้งานบอท UDO ครั้งแรก
 bot.start((ctx) => {
-  ctx.reply('🦆 สวัสดีครับพี่พร (Phon)! ยินดีต้อนรับสู่ศูนย์บัญชาการ UDO Command Center บน Telegram ครับ\n\n📌 คำสั่งสแตนด์บายพร้อมใช้งาน:\n1. พิมพ์คำว่า "สรุปข่าว" หรือส่งคีย์ /news ➡️ เพื่อดึงข่าวไอทีล่าสุด 5 ข่าวพร้อมเสิร์ฟแบบคลีนๆ\n2. ใช้คำสั่ง /draft หรือ /ร่าง ➡️ เพื่อป้อนข้อมูลให้ Qwen 3.5 ร่างคอนเทนต์แอดเป็ดให้ทันทีครับ! (เช่น `/draft แนะนำตัวเองสั้นๆ`)');
+  const sources = Object.keys(UdoNewsAgent.SOURCES).join(', ');
+  const categories = Object.keys(UdoNewsAgent.CATEGORIES).join(', ');
+  ctx.reply(
+    '🦆 สวัสดีครับพี่พร (Phon)! ยินดีต้อนรับสู่ศูนย์บัญชาการ UDO Command Center บน Telegram ครับ\n\n' +
+    '📌 คำสั่งสแตนด์บายพร้อมใช้งาน:\n' +
+    '1. /news — ดึงข่าวล่าสุด 5 อันดับจาก Blognone (default)\n' +
+    '   ระบุแหล่งข่าวอื่น: /news techcrunch หรือ /news startup\n' +
+    `   ชื่อเว็บที่รองรับ: ${sources}\n` +
+    `   Category: ${categories}\n` +
+    '2. /draft <ข้อความ> — ให้ Qwen 3.5 ร่างคอนเทนต์ทันที'
+  );
 });
 
 // ============================================================================
 // 📰 1. โหมดดักรับสั่งสรุปข่าวสารไอที 5 อันดับแรก (IT News summary)
 // ============================================================================
-bot.hears([/^\/news$/, 'สรุปข่าว', 'ดึงข่าว'], async (ctx) => {
-  // ด่านคัดกรอง: ปฏิเสธงานซ้อนหากแรมกำลังโหลดคิวอื่นค้างอยู่
+bot.hears([/^\/news(\s+\S+)?$/, 'สรุปข่าว', 'ดึงข่าว'], async (ctx) => {
+  // แยกชื่อแหล่งข่าวจากคำสั่ง — คำสุดท้ายหลัง keyword คือ source (ถ้าไม่มีใช้ค่า default blognone)
+  const words = ctx.message.text.trim().split(/\s+/);
+  const source = words.length > 1 ? words[words.length - 1].toLowerCase() : 'blognone';
+
+  // ตรวจสอบชื่อแหล่งข่าวก่อนล็อคคิว เพื่อตอบ error ได้ทันทีโดยไม่กินแรม
+  let newsAgent;
+  try {
+    newsAgent = new UdoNewsAgent({ aiModel: 'qwen3.5:9b', source });
+  } catch (e) {
+    return ctx.reply(`⚠️ ${e.message}`);
+  }
+
   if (isAiProcessing) {
     return ctx.reply('⚠️ UDO กำลังประมวลผลงานของพี่พรคิวก่อนหน้านี้อยู่ครับ โปรดรอสักครู่นะครับเพื่อไม่ให้แรม Mac ทำงานหนักเกินไป');
   }
 
   let loadingMessage;
   try {
-    // ล็อคคิวสถานะ
     isAiProcessing = true;
 
-    // 1. ส่งสถานะจำลองการพิมพ์ (User Experience)
     await ctx.sendChatAction('typing');
-    loadingMessage = await ctx.reply('📡 UDO กำลังเปิดฟีด XML ดึงข่าวและส่งต่อให้ Qwen 3.5 (9B) ย่อยข้อมูลให้อยู่นะครับพี่พร...');
+    loadingMessage = await ctx.reply(`📡 UDO กำลังดึงข่าว 5 อันดับจาก *${source}* และส่งให้ Qwen 3.5 สรุปให้อยู่นะครับพี่พร...`, { parse_mode: 'Markdown' });
 
-    // 2. เรียกใช้โมดูลเอเจนต์หลังบ้านเพื่อสอยสรุปข่าวย่อ 5 ข่าวล่าสุด (จำกัด 5 ข่าวเพื่อประมวลผลเร็วแสง)
-    const newsSummary = await newsAgent.getLatestNewsSummary(5);
+    const newsSummary = await newsAgent.getLatestNewsSummary();
 
-    // 3. ปลดป้ายรอโหลด และพ่นเนื้อหาข่าวส่งตรงเข้ามือถือพี่พร
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMessage.message_id).catch(() => {});
-    
+
     try {
-      await ctx.reply(`📰 **[รายงานข่าวสารไอที 5 อันดับโดย UDO]**\n\n${newsSummary}`, { parse_mode: 'Markdown' });
+      await ctx.reply(`📰 **[รายงานข่าวสาร 5 อันดับจาก ${source.toUpperCase()} โดย UDO]**\n\n${newsSummary}`, { parse_mode: 'Markdown' });
     } catch (parseError) {
-      console.warn('⚠️ เกิดปัญหาสัญลักษณ์พิเศษใน Markdown สลับมาส่งแบบข้อความธรรมดารองรับแทน...');
       const plainSummary = newsSummary.replace(/[*_`#]/g, '');
-      await ctx.reply(`📰 [รายงานข่าวสารไอที 5 อันดับโดย UDO]\n\n${plainSummary}`);
+      await ctx.reply(`📰 [รายงานข่าวสาร 5 อันดับจาก ${source.toUpperCase()} โดย UDO]\n\n${plainSummary}`);
     }
 
   } catch (error) {
@@ -98,7 +110,6 @@ bot.hears([/^\/news$/, 'สรุปข่าว', 'ดึงข่าว'], asy
     }
     await ctx.reply('⚠️ ขออภัยครับพี่พร เกิดข้อผิดพลาดทางเทคนิคขณะสแกนสรุปข่าว ลองตรวจสอบสถานะ Ollama อีกครั้งนะครับ');
   } finally {
-    // ปลดล็อคสถานะคิวงานเสมอให้พร้อมรับภารกิจต่อไปอย่างปลอดภัย
     isAiProcessing = false;
   }
 });
@@ -106,7 +117,7 @@ bot.hears([/^\/news$/, 'สรุปข่าว', 'ดึงข่าว'], asy
 // ============================================================================
 // ✍️ 2. โหมดแกะสกัดข้อความเพื่อ "ร่างคอนเทนต์" (Dynamic Content Drafting)
 // ============================================================================
-bot.on('text', async (ctx) => {
+bot.on(message('text'), async (ctx) => {
   const userMessage = ctx.message.text.trim();
 
   // ตรวจเช็กว่าประโยคของพี่พรขึ้นต้นด้วย /draft, /ร่าง, draft, หรือ ร่าง

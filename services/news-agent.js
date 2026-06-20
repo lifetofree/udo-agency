@@ -3,118 +3,144 @@ import ollama from 'ollama';
 import * as cheerio from 'cheerio';
 
 /**
- * UdoNewsAgent - เอเจนต์สรุปข่าวสารและย่อยข้อมูลไอทีด้วย Qwen 3.5 (9B)
- * ออกแบบโครงสร้างแบบทนทานสูง (Fault-Tolerant Clean Architecture)
- * รองรับการดึงข้อมูลทั้ง Atom Feed และ RSS Feed พร้อมระบบดีบั๊กประเมินการตรวจจับ Cloudflare
+ * UdoNewsAgent - เอเจนต์สรุปข่าวสารด้วย AI โดยระบุแหล่งข่าวเป็นชื่อเว็บหรือ category
+ * รองรับ Atom Feed และ RSS Feed พร้อมระบบตรวจจับ Cloudflare
  */
 export class UdoNewsAgent {
+  // รายชื่อแหล่งข่าวที่รองรับและ Feed URL ปลายทาง
+  static SOURCES = {
+    blognone:    'https://www.blognone.com/atom.xml',
+    techcrunch:  'https://techcrunch.com/feed/',
+    theverge:    'https://www.theverge.com/rss/index.xml',
+    wired:       'https://www.wired.com/feed/rss',
+    arstechnica: 'https://feeds.arstechnica.com/arstechnica/index',
+  };
+
+  // mapping จาก category ไปยังชื่อแหล่งข่าว (รองรับทั้งภาษาอังกฤษและไทย)
+  static CATEGORIES = {
+    tech:          'blognone',
+    ไอที:          'blognone',
+    startup:       'techcrunch',
+    สตาร์ทอัพ:     'techcrunch',
+    gadget:        'theverge',
+    แกดเจ็ต:       'theverge',
+    science:       'wired',
+    วิทยาศาสตร์:   'wired',
+    ai:            'arstechnica',
+  };
+
   /**
-   * @param {Object} config - การตั้งค่าตัวแปรโมเดลและพิกัดข่าวสาร
+   * แปลงชื่อแหล่งข่าวหรือ category เป็น Feed URL
+   * โยน Error ทันทีหากระบุชื่อที่ไม่รู้จัก เพื่อป้องกันเรียกใช้งาน URL ผิดพลาด
+   * @param {string} source - ชื่อเว็บหรือ category
+   * @returns {string} Feed URL
+   */
+  static resolveSource(source) {
+    if (UdoNewsAgent.SOURCES[source]) {
+      return UdoNewsAgent.SOURCES[source];
+    }
+    const mapped = UdoNewsAgent.CATEGORIES[source];
+    if (mapped) {
+      return UdoNewsAgent.SOURCES[mapped];
+    }
+    const validSources = Object.keys(UdoNewsAgent.SOURCES).join(', ');
+    const validCategories = Object.keys(UdoNewsAgent.CATEGORIES).join(', ');
+    throw new Error(
+      `ไม่รู้จักแหล่งข่าว "${source}"\nชื่อเว็บที่ใช้ได้: ${validSources}\nCategory ที่ใช้ได้: ${validCategories}`
+    );
+  }
+
+  /**
+   * @param {Object} config
+   * @param {string} [config.source='blognone'] - ชื่อเว็บหรือ category (ไม่รับ URL ตรงๆ)
+   * @param {string} [config.aiModel='qwen3.5:9b']
    */
   constructor(config = {}) {
     this.scraper = new UdoScraper();
     this.aiModel = config.aiModel || 'qwen3.5:9b';
-    // ใช้ Atom XML Feed เป็นหลัก
-    this.newsUrl = config.newsUrl || 'https://www.blognone.com/atom.xml';
+    const source = config.source || 'blognone';
+    // resolveSource โยน Error ทันทีหากชื่อไม่ถูกต้อง — fail fast ตั้งแต่ต้น
+    this.newsUrl = UdoNewsAgent.resolveSource(source);
+    this.sourceName = source;
   }
 
   /**
-   * ดึงข่าวไอทีล่าสุดและส่งต่อให้สมองกลย่อยประเด็นสำคัญในคำสั่งเดียว
-   * @param {number} limit - จำนวนบทความข่าวสารสูงสุดที่ต้องการสรุป (เริ่มต้นที่ 10)
-   * @returns {Promise<string>} - ผลลัพธ์สรุปข่าวสารรูปประโยคแบบ Markdown
+   * ดึงข่าวล่าสุด 5 อันดับและสรุปด้วย AI
+   * @param {number} [limit=5]
+   * @returns {Promise<string>} ข้อความสรุปข่าวแบบ Markdown
    */
-  async getLatestNewsSummary(limit = 10) {
+  async getLatestNewsSummary(limit = 5) {
     try {
-      console.log(`📡 [UDO News] กำลังเริ่มต้นดึงข้อมูลผ่านระบบปิดจาก: ${this.newsUrl}`);
-      
-      // 1. ดึงข้อมูลดิบจากหน้าเว็บ (ดึงมาเป็นข้อความดิบเพื่อทำการตรวจสอบประเภทก่อนสกัด)
+      console.log(`[UDO News] ดึงข้อมูลจาก ${this.sourceName}: ${this.newsUrl}`);
+
       const rawPayload = await this.scraper.fetchHtml(this.newsUrl);
-      
+
       if (!rawPayload || rawPayload.trim().length === 0) {
         throw new Error('ระบบปลายทางส่งข้อมูลกลับมาเป็นค่าว่างเปล่า');
       }
 
-      // 2. ตรวจสอบว่าโดน Cloudflare บล็อกและแอบส่งหน้าเว็บ HTML ท้าทายกลับมาหรือไม่
-      const isHtmlResponse = rawPayload.trim().startsWith('<html') || 
+      // ตรวจสอบว่าโดน Cloudflare บล็อกและส่งหน้า HTML challenge กลับมาแทน XML
+      const isHtmlResponse = rawPayload.trim().startsWith('<html') ||
                              rawPayload.trim().startsWith('<!DOCTYPE html') ||
                              rawPayload.includes('cloudflare') ||
                              rawPayload.includes('noscript');
 
       if (isHtmlResponse) {
-        console.error('⚠️ [UDO Warning] ตรวจพบข้อมูลขากลับเป็นหน้าเว็บ HTML ทั่วไป แทนที่จะเป็น XML Feed!');
-        console.error('📝 ตัวอย่างเนื้อหาที่ได้รับ (First 300 chars):');
-        console.error(`----------------\n${rawPayload.substring(0, 300).trim()}\n----------------`);
-        throw new Error('ตรวจพบระบบป้องกันของ Cloudflare หรือการส่งคืนประเภทข้อมูลผิดพลาด (ได้รับ HTML แทน XML)');
+        console.error('[UDO News] ตรวจพบ Cloudflare block หรือข้อมูลไม่ใช่ XML Feed');
+        console.error(`ตัวอย่าง 300 ตัวอักษรแรก:\n${rawPayload.substring(0, 300).trim()}`);
+        throw new Error('ได้รับ HTML แทน XML Feed — อาจถูก Cloudflare บล็อก');
       }
 
-      // 3. เริ่มต้นแกะสกัดข้อมูลด้วยระบบตรวจจับอัจฉริยะ (Adaptive Parser)
       // ใช้ xmlMode: true เพื่อจัดการแท็ก self-closing และ namespace ของ Atom/RSS ได้ถูกต้อง
       const $ = cheerio.load(rawPayload, { xmlMode: true });
       const newsList = [];
 
-      // ตรวจสอบโครงสร้าง: ค้นหาว่าใช้โครงสร้างข่าวแบบ Atom (<entry>) หรือ RSS (<item>)
       const isAtom = $('entry').length > 0;
-      const isRss = $('item').length > 0;
+      const isRss  = $('item').length > 0;
 
       if (isAtom) {
-        console.log('🤖 [UDO News] ตรวจพบโครงสร้างข่าวสารแบบ Atom Feed');
-        $('entry').each((index, element) => {
+        console.log(`[UDO News] ตรวจพบ Atom Feed จาก ${this.sourceName}`);
+        $('entry').each((_, element) => {
           const $el = $(element);
-          
-          // ลิงก์ของ Atom มักจะฝังอยู่ในแอตทริบิวต์ href ของแท็ก <link>
-          let link = $el.find('link').attr('href') || $el.find('link').text().trim();
-          
           newsList.push({
-            title: $el.find('title').text().trim(),
-            link: link,
-            description: $el.find('summary').text().trim() || $el.find('content').text().trim()
+            title:       $el.find('title').text().trim(),
+            link:        $el.find('link').attr('href') || $el.find('link').text().trim(),
+            description: $el.find('summary').text().trim() || $el.find('content').text().trim(),
           });
         });
       } else if (isRss) {
-        console.log('🤖 [UDO News] ตรวจพบโครงสร้างข่าวสารแบบ RSS Feed');
-        $('item').each((index, element) => {
+        console.log(`[UDO News] ตรวจพบ RSS Feed จาก ${this.sourceName}`);
+        $('item').each((_, element) => {
           const $el = $(element);
-          
-          // ลิงก์ของ RSS มักจะอยู่เป็นค่าข้อความตรงกลางแท็ก <link>
-          let link = $el.find('link').text().trim() || $el.find('link').attr('href');
-          
           newsList.push({
-            title: $el.find('title').text().trim(),
-            link: link,
-            description: $el.find('description').text().trim()
+            title:       $el.find('title').text().trim(),
+            link:        $el.find('link').text().trim() || $el.find('link').attr('href'),
+            description: $el.find('description').text().trim(),
           });
         });
       } else {
-        // หากไม่พบคอนเทนเนอร์ทั้งสองแบบ ให้ทำการพ่นข้อความระบบดีบั๊กเพื่อช่วยเหลือการพัฒนา TDD
-        console.error('❌ [UDO Parser Error] ไม่พบแท็ก <entry> หรือ <item> ในโครงสร้างไฟล์ที่ได้รับ');
-        console.error('📝 ตัวอย่างไฟล์ที่ได้รับจริง (First 300 chars):');
-        console.error(`----------------\n${rawPayload.substring(0, 300).trim()}\n----------------`);
+        console.error(`[UDO News] ไม่พบแท็ก <entry> หรือ <item> ใน Feed จาก ${this.sourceName}`);
+        console.error(`ตัวอย่าง 300 ตัวอักษรแรก:\n${rawPayload.substring(0, 300).trim()}`);
         throw new Error('ไม่สามารถระบุโครงสร้าง XML Feed ได้ (ไม่พบ entry หรือ item)');
       }
 
-      // 4. เลือกรายการข่าวสารจำกัดตามจำนวนที่ระบบต้องการ
       const topNews = newsList.slice(0, limit);
-      
       if (topNews.length === 0) {
         throw new Error('ไม่พบข้อมูลข่าวสารพร้อมใช้งานภายใน Feed');
       }
 
-      // 5. แปลงก้อนข่าวสารให้อยู่ในรูปประโยค Context สำหรับส่งให้ AI
+      // แปลงรายการข่าวเป็น context string สำหรับส่งให้ AI
       const newsContext = topNews.map((news, index) => {
-        const title = news.title || 'ไม่มีหัวข้อข่าว';
-        const link = news.link || '#';
+        const title       = news.title       || 'ไม่มีหัวข้อข่าว';
         const description = news.description || 'ไม่มีรายละเอียดเพิ่มเติม';
+        let   link        = news.link        || '#';
         // แปลง protocol-relative URL (//example.com) → https://example.com
-        let cleanLink = link;
-        if (cleanLink && cleanLink.startsWith('//')) {
-          cleanLink = `https:${cleanLink}`;
-        }
-        return `[ข่าวที่ ${index + 1}] หัวข้อ: ${title}\nลิงก์อ่านต่อ: ${cleanLink}\nเรื่องย่อ: ${description.substring(0, 150)}...\n---`;
+        if (link.startsWith('//')) link = `https:${link}`;
+        return `[ข่าวที่ ${index + 1}] หัวข้อ: ${title}\nลิงก์: ${link}\nเรื่องย่อ: ${description.substring(0, 150)}...\n---`;
       }).join('\n');
 
-      console.log(`🧠 [UDO News] คัดกรองข่าวสำเร็จจำนวน ${topNews.length} ข่าว กำลังเชื่อมโยงส่งต่อให้โมเดล: ${this.aiModel}`);
+      console.log(`[UDO News] คัดกรองข่าว ${topNews.length} ข่าว กำลังส่งให้ ${this.aiModel}`);
 
-      // กำหนดบทบาทควบคุมภาษาและสำนวน "แอดเป็ด"
       const systemPrompt = `คุณคือ "แอดเป็ด" สุดยอด AI Content Creator ประจำระบบ UDO
 หน้าที่ของคุณคือรับข่าวสารไอทีล่าสุด แล้วทำ "สรุปประเด็นสำคัญ" ให้เข้าใจง่าย ดึงดูด กระชับ และคลีนที่สุด
 
@@ -126,83 +152,83 @@ export class UdoNewsAgent {
 5. ตกแต่งด้วย Emoji ที่สอดคล้องกับข่าวสารเพื่อเพิ่มมิติความน่าสนใจ
 6. ปฏิเสธการพิมพ์ขั้นตอนการคิดในใจอย่าง <think>...</think> ออกมายังคำตอบหลักเด็ดขาด ให้พ่นเฉพาะข้อความที่สรุปแล้วเท่านั้น`;
 
-      const prompt = `${systemPrompt}\n\nนี่คือรายชื่อเนื้อความข่าวดิบไอทีล่าสุด โปรดจัดโครงสร้างสรุปย่อย:\n\n${newsContext}`;
-
-      // ส่งคำขอเข้าสู่ระบบ Ollama Engine
       const response = await ollama.generate({
         model: this.aiModel,
-        prompt: prompt
+        prompt: `${systemPrompt}\n\nนี่คือรายชื่อเนื้อความข่าวดิบล่าสุดจาก ${this.sourceName} โปรดจัดโครงสร้างสรุปย่อย:\n\n${newsContext}`,
       });
 
-      if (!response || !response.response) {
-        throw new Error(`โมเดล AI (${this.aiModel}) ตอบกลับค่าว่างเปล่า หรือเกิดข้อขัดข้องในระบบประมวลผลของ Ollama`);
+      if (!response?.response) {
+        throw new Error(`โมเดล AI (${this.aiModel}) ตอบกลับค่าว่างเปล่า`);
       }
 
-      const aiText = response.response;
-      console.log(`✨ [UDO News] ได้รับคำตอบดิบจาก Ollama เรียบร้อยแล้ว (ขนาด: ${aiText.length} ตัวอักษร)`);
+      console.log(`[UDO News] ได้รับคำตอบจาก Ollama (${response.response.length} ตัวอักษร)`);
 
-      const cleanedResult = this.cleanResponse(aiText);
-      if (!cleanedResult || cleanedResult.trim().length === 0) {
-        throw new Error('ผลสรุปข่าวจาก AI เป็นค่าว่างเปล่าหลังจากหักล้างประวัติการคิดในใจ (<think>) เรียบร้อยแล้ว');
+      const cleanedResult = this.cleanResponse(response.response);
+      if (!cleanedResult) {
+        throw new Error('ผลสรุปข่าวจาก AI ว่างเปล่าหลังกรอง <think>');
       }
 
       return cleanedResult;
 
     } catch (error) {
-      console.error('🔴 [UDO News] เกิดความล้มเหลวระหว่างดำเนินการประมวลผลข่าว:', error.message);
+      console.error('[UDO News] ประมวลผลข่าวล้มเหลว:', error.message);
       throw error;
     }
   }
 
   /**
-   * ฟังก์ชันชำระล้างคำตอบ ปล้นสะดมแท็กขั้นตอนการคิด <think> ออกจากข้อความ
-   * @param {string} text - ข้อความจากระบบ AI
-   * @returns {string} - ข้อความสรุปเนื้อหาที่สะอาดและจัดรูปใหม่เรียบร้อย
+   * ลบแท็ก <think>...</think> ออกจากคำตอบ AI เพื่อป้องกัน chain-of-thought รั่วไหลสู่ผู้ใช้
+   * @param {string} text
+   * @returns {string}
    */
   cleanResponse(text) {
     if (!text) return '';
-    
     let cleaned = text;
-    
-    // 🛡️ ระบบสกัดขั้นสูง: ป้องกันกรณีโมเดลแอบพ่นขั้นตอนคิดลึกออกมาก่อนตั้งแต่ตัวอักษรแรกโดยลืมใส่แท็กเปิด <think>
+    // กรณีโมเดลลืมแท็กเปิด <think> แต่ใส่แท็กปิด </think> ไว้
     if (cleaned.includes('</think>')) {
       cleaned = cleaned.substring(cleaned.indexOf('</think>') + 8);
     }
-    
-    // ล้างแท็กและขั้นตอนคิดลึก <think>...</think> มาตรฐานที่เหลือออกไปทั้งหมด
     cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/g, '');
-    
     return cleaned.trim();
   }
 }
 
 // ============================================================================
-// 🧪 ระบบ Unit Test จำลองประสิทธิภาพหลังบ้าน (TDD Ready Suite)
-// สั่งรันเพื่อตรวจสอบลอจิกระดับหน่วยบริการใน Terminal: node services/news-agent.js
+// 🧪 Self-Test Suite
+// รันตรงในเทอร์มินัล: node services/news-agent.js
 // ============================================================================
 async function runSelfTest() {
-  console.log('🧪 [TDD] เริ่มต้นระบบทดสอบการสรุปและประมวลผลข่าวจริงผ่านระบบจำลอง...');
-  const testAgent = new UdoNewsAgent({
-    aiModel: 'qwen3.5:9b'
-  });
+  console.log('🧪 [TDD] ทดสอบ UdoNewsAgent...');
 
+  // ทดสอบ resolveSource ด้วยชื่อเว็บตรงๆ
+  const url = UdoNewsAgent.resolveSource('blognone');
+  console.assert(url.includes('blognone.com'), '❌ resolveSource blognone ล้มเหลว');
+  console.log('✅ resolveSource ด้วยชื่อเว็บผ่าน');
+
+  // ทดสอบ resolveSource ด้วย category
+  const techUrl = UdoNewsAgent.resolveSource('tech');
+  console.assert(techUrl.includes('blognone.com'), '❌ resolveSource category tech ล้มเหลว');
+  console.log('✅ resolveSource ด้วย category ผ่าน');
+
+  // ทดสอบ resolveSource ชื่อไม่ถูกต้องต้องโยน Error
   try {
-    const result = await testAgent.getLatestNewsSummary(3); // ทดสอบดึงพรีวิวสั้นๆ 3 ข่าวแรก
-    
-    // 🛡️ ปรับปรุงระบบ Assert สไตล์ TDD สากล (Strict Check)
-    // หากตรวจพบว่าผลลัพธ์ไม่ผ่านเกณฑ์ จะโยน Error หยุดระบบทันที เพื่อส่งสัญญาณล้มเหลวไปบล็อก catch อย่างถูกต้อง
-    if (!result || result.trim().length === 0) {
-      throw new Error('เทสล้มเหลว: ผลสรุปข่าวเป็นค่าว่างเปล่า (Empty Result)');
-    }
-    if (result.includes('<think>')) {
-      throw new Error('เทสล้มเหลว: ระบบตรวจพบขั้นตอนความคิด (<think>) หลุดรอดมายังผลลัพธ์สุดท้าย');
-    }
-    
-    console.log('✅ [TDD] การทดสอบดึงและสรุปข่าวสารจาก XML Feed จริงผ่านฉลุย 100%!');
-    console.log('📊 หน้าตาข้อความที่จะสแตนด์บายส่งต่อไปยัง Gateway:\n');
+    UdoNewsAgent.resolveSource('unknownsource');
+    console.error('❌ ควรโยน Error แต่ไม่โยน');
+  } catch (e) {
+    console.log('✅ resolveSource ชื่อไม่ถูกต้องโยน Error ถูกต้อง');
+  }
+
+  // ทดสอบดึงข่าวจริงจาก blognone (ต้องมีอินเทอร์เน็ตและ Ollama)
+  console.log('\n🧪 ทดสอบดึงข่าวจริงจาก blognone (top 3)...');
+  const agent = new UdoNewsAgent({ source: 'blognone', aiModel: 'qwen3.5:9b' });
+  try {
+    const result = await agent.getLatestNewsSummary(3);
+    if (!result || result.trim().length === 0) throw new Error('ผลสรุปว่างเปล่า');
+    if (result.includes('<think>')) throw new Error('<think> หลุดมาในผลลัพธ์');
+    console.log('✅ ดึงและสรุปข่าวจริงผ่าน!\n');
     console.log(result);
-  } catch (error) {
-    console.error('❌ [TDD] การทดสอบล้มเหลวพบข้อผิดพลาด:', error.message);
+  } catch (e) {
+    console.error('❌ ทดสอบดึงข่าวจริงล้มเหลว:', e.message);
   }
 }
 
