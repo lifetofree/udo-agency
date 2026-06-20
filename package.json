@@ -1,0 +1,20 @@
+{
+  "name": "udo-agency",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "axios": "^1.18.0",
+    "cheerio": "^1.2.0",
+    "dotenv": "^17.4.2",
+    "ollama": "^0.6.3",
+    "telegraf": "^4.16.3"
+  }
+}
